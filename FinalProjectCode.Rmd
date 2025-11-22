@@ -62,10 +62,10 @@ schools_treatment <- data %>%
   mutate(treatment = as.numeric(num_treatment > 0))
 head(schools_treatment)
 
-num_control_schools <- sum(schools_treatment_counts$num_control > 0)
+num_control_schools <- sum(schools_treatment$num_control > 0)
 paste0("Number of control schools: ", num_control_schools)
 
-num_treatment_schools <- sum(schools_treatment_counts$num_treatment > 0)
+num_treatment_schools <- sum(schools_treatment$num_treatment > 0)
 paste0("Number of treatment schools: ", num_treatment_schools)
 ```
 
@@ -222,11 +222,10 @@ p_value
 
 # Matching
 
-```{r}
+```{r macthing}
 library(DOS2)
 library(optmatch)
 library(RItools)
-source("utility.R")
 
 matching_data <- data[, c("grade", "female", "age", "language", "region", "treatment", "read_comp_score")]
 
@@ -259,7 +258,6 @@ plot(xBalance(treatment ~ grade + female + age + language + region - 1,
 matching_data <- matching_data %>% mutate(pair_id = ms)
 paste0("Proportion of matched units = ", mean(is.na(matching_data$pair_id)))
 
-library(tidyverse)
 # pair_ps <- matching_data %>%
 #   mutate(pair_id = ms) %>%
 #   filter(!is.na(pair_id)) %>%
