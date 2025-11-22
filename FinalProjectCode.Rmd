@@ -1,0 +1,336 @@
+---
+title: "Stats 209 Final Project Code"
+author: "Trent Bellinger"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+https://www.datalumos.org/datalumos/project/237384/version/V1/view?path=/datalumos/237384/fcr:versions/V1/Ethiopia/Improving-Quality-of-Primary-Education-Program--IQPEP-
+
+```{r}
+library(tidyverse)
+library(DescTools)
+
+# read in the csv and choose the columns we will use
+data <- read.csv('endline.csv', header = TRUE)
+data <- data[, c("grade", "female", "age", "language", "region", "school_type", 
+                 "encrypted_school_code", "treatment", "read_comp_score", "orf")]
+
+# change the treatment variable to a binary integer
+data$treatment <- ifelse(data$treatment == "Control", 0, 1)
+
+# change school code to be 1,...,num_schools, remove original column
+data$school_id <- as.numeric(factor(data$encrypted_school_code, levels = unique(data$encrypted_school_code)))
+data <- data %>% select(-encrypted_school_code)
+
+# convert character columns to factor
+data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.factor)
+
+# remove rows with NAs
+data <- na.omit(data)
+
+# set up covariates (X), response (Y), and treatment (Z)
+X <- data[, c("grade", "female", "age", "language", "region", "school_type")]
+Z <- data$treatment
+Y <- data$read_comp_score # can also use orf (oral reading fluency)
+```
+
+# Clusters with Doubly-Robust Estimand
+
+* We conduct a cluster random experiment with school as the cluster.
+* Each school is assigned to be treatment or control, so all units within the same cluster have the same treatment assignment.
+* Denote each school as a variable $S$ where $S \in {1,...,K}$
+
+```{r num_schools}
+schools <- unique(data$school_id)
+K <- length(schools)
+paste0("Number of schools: ", K)
+```
+
+* We have 240 schools in the experiment, so $K = 240$.
+* Just as a sanity check, we will now make sure that each school contains only treatment units or only control units.
+* We will then check the number of treatment schoola and the number of control schools.
+
+```{r school_treatment_control}
+schools_treatment <- data %>% 
+  group_by(school_id) %>% 
+  mutate(num_students = n()) %>%
+  mutate(num_treatment = sum(treatment)) %>% 
+  mutate(num_control = n() - sum(treatment)) %>%
+  select(school_id, num_students, num_treatment, num_control) %>%
+  distinct() %>%
+  mutate(treatment = as.numeric(num_treatment > 0))
+head(schools_treatment)
+
+num_control_schools <- sum(schools_treatment_counts$num_control > 0)
+paste0("Number of control schools: ", num_control_schools)
+
+num_treatment_schools <- sum(schools_treatment_counts$num_treatment > 0)
+paste0("Number of treatment schools: ", num_treatment_schools)
+```
+
+* We have 120 treatment schools and 120 control schools.
+* Denote $n_{[k]} = \#\{i:X_{i}=k\}$.
+* Let $T_{k} \in \{0,1\}$, $k=1,...,K$, be the treatment indicator for each cluster.
+* We create vectors to store the $n_{k}$'s, the $k$'s, and the $T_{k}$'s.
+
+```{r cluster treatment vector}
+nk_vec <- schools_treatment$num_students
+k_vec <- schools_treatment$school_id
+T_vec <- schools_treatment$treatment
+```
+
+* Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level to estimate propensity score.
+* We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, region, and school type of each school.
+
+```{r aggregate covariates by school}
+# collapse student covariates to school level for the propensity model
+school_summary <- X %>%
+  mutate(school_id = data$school_id) %>%
+  group_by(school_id) %>%
+  mutate(num_2grade = sum(grade == 2)) %>%
+  mutate(num_3grade = sum(grade == 3)) %>%
+  mutate(num_female = sum(female == "Female")) %>%
+  mutate(num_male = sum(female == "Male")) %>%
+  mutate(avg_age = mean(age)) %>%
+  mutate(sd_age = sd(age)) %>%
+  mutate(region = Mode(region)) %>%
+  mutate(common_language = Mode(language)) %>%
+  mutate(school_type = Mode(school_type)) %>%
+  select(-grade, -female, -age, -language, -region) %>%
+  distinct()
+head(school_summary)
+```
+
+* Now that we have aggregated covariates, we can calculate the propensity score for each school using logistic regression.
+
+```{r school-level ps}
+# estimate school-level propensity score using logistic regression
+ps_model <- glm(T_vec ~ . - school_id, data = school_summary, family = binomial)
+e_hat_school <- ps_model$fitted.values
+
+# expand to student level
+e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]
+```
+
+* Now that we have propensity scores for each school, we will create an outcome model on the student level using linear regression. We will evaluate that model on each student with $Z=1$ and $Z=0$ to get $\mu_{1}$ and $\mu_{0}$.
+
+```{r outcome model}
+# estimate outcome model using linear regression
+out_mod <- lm(Y ~ Z + ., data = X)
+
+data_Z1 <- X
+data_Z1$Z <- 1
+data_Z0 <- X
+data_Z0$Z <- 0
+
+mu1_hat <- predict(out_mod, newdata = data_Z1)
+mu0_hat <- predict(out_mod, newdata = data_Z0)
+```
+
+* Now that we have propensity score and outcome model prediction fro each student/school, we can compute a doubly-robust AIPW estimand for each student. Our final estimand will be thge mean of these values.
+
+```{r AIPW tau_hat}
+# AIPW score per student
+aipw <- (Z * (Y - mu1_hat) / e_hat_student) - ((1 - Z) * (Y - mu0_hat) / (1 - e_hat_student)) + (mu1_hat - mu0_hat)
+tau_hat <- mean(aipw)
+paste0("tau_hat = ", tau_hat)
+```
+
+* We can now compute a variance estimate of our estimand.
+
+```{r variance estimation}
+# cluster-robust variance: aggregate student contributions per school
+# Use cluster-level sums U_s = sum_{i in s} aipw_i
+U_s <- tapply(aipw, data$school_id, sum)   # length S
+S <- length(U_s)
+U_bar <- mean(U_s)
+
+# variance estimator: Var(tau_hat) = 1/S^2 * Var_emp(U_s) where Var_emp uses (S-1) denom
+var_hat <- (1 / (S^2)) * (sum( (U_s - U_bar)^2) / (S - 1))
+se_hat  <- sqrt(var_hat)
+paste0("SE_hat = ", se_hat)
+```
+
+* Using this standard error approximation, we can compute a confidence interval.
+
+```{r confidence interval}
+# 95% CI
+ci_lower <- tau_hat - qt(0.975, df = S - 1) * se_hat
+ci_upper <- tau_hat + qt(0.975, df = S - 1) * se_hat
+
+paste0("95% confidence interval: [", ci_lower, ", ", ci_upper, "]")
+```
+
+# Clusters with Diff-In-Means
+
+```{r cluster diff-in-means}
+schools <- unique(data$encrypted_school_code)
+K <- length(schools)
+
+Ybar_vec <- numeric(K)
+k_vec <- numeric(K)
+Z_k_vec <- numeric(K)
+
+for (i in seq_along(schools)) {
+  idx <- which(cluster == schools[i])
+  k_vec[i] <- length(idx)
+  Ybar_vec[i] <- mean(Y[idx])
+  Z_k_vec[i] <- unique(Z[idx])   # assumes cluster-level treatment (same inside cluster)
+}
+
+# group counts
+K_1 <- sum(Z_k_vec == 1)
+K_0 <- sum(Z_k_vec == 0)
+
+tau_hat <- mean(Ybar_vec[Z_k_vec == 1]) - mean(Ybar_vec[Z_k_vec == 0])
+
+s1_sq <- var(Ybar_vec[Z_k_vec == 1])
+s0_sq <- var(Ybar_vec[Z_k_vec == 0])
+var_hat <- s1_sq / K_1 + s0_sq / K_0
+se_hat  <- sqrt(var_hat)
+
+# CI using t with G-2 df
+df <- K - 2
+tcrit <- qt(0.975, df)
+CI <- c(tau_hat - tcrit * se_hat, tau_hat + tcrit * se_hat)
+
+list(estimate = tau_hat, se = se_hat, df = df, CI = CI, num_clusters = K)
+```
+
+# Simple FRT with Diff-In-Means
+
+```{r simple FRT with diff-in-means}
+n <- length(Z)
+n_0 <- sum(Z == 0)
+n_1 <- sum(Z == 1)
+
+# simple diff-in-means with FRT ignoring covariates
+tau_hat <- mean(Y[Z == 1]) - mean(Y[Z == 0])
+
+tau_hat_dist <- c()
+B <- 10000
+for (i in 1:B) {
+  Z_resamp <- rep(0, n)
+  Z_resamp[sample(1:n, n_1, replace = FALSE)] <- 1
+  tau_hat_dist <- c(tau_hat_dist, mean(Y[Z_resamp == 1]) - mean(Y[Z_resamp == 0]))
+}
+
+p_value <- mean(tau_hat_dist > tau_hat)
+p_value
+```
+
+# Matching
+
+```{r}
+library(DOS2)
+library(optmatch)
+library(RItools)
+source("utility.R")
+
+matching_data <- data[, c("grade", "female", "age", "language", "region", "treatment", "read_comp_score")]
+
+xBalance(treatment ~ grade + female + age + language + region, data = matching_data)
+
+matching_data$pscore <- glm(treatment ~ grade + female + age + language + region, 
+                            family = binomial, data = matching_data)$fitted.values
+
+# ggplot(matching_data, aes(x = pscore, fill = factor(treatment))) +
+#   geom_histogram(aes(y = after_stat(density)),
+#                  alpha = 0.5, position = "identity", bins = 30) +
+#   scale_fill_manual(values = c("blue", "red"),
+#                     name = "Group",
+#                     labels = c("Control", "Treatment")) +
+#   labs(
+#     title = "Distribution of Propensity Score by Treatment Group",
+#     x = "Propensity Score",
+#     y = "Count"
+#   ) +
+#   theme_minimal(base_size = 14)
+
+options("optmatch_max_problem_size" = Inf)
+match <- match_on(treatment ~ grade + female + age + language + region, data = matching_data)
+ms <- pairmatch(match, data = matching_data)
+
+# plot the covariate differences before and after matching
+plot(xBalance(treatment ~ grade + female + age + language + region - 1, 
+              strata = list(unstrat = NULL, ms.1 = ~ms), data = matching_data), ggplot = TRUE)
+
+matching_data <- matching_data %>% mutate(pair_id = ms)
+paste0("Proportion of matched units = ", mean(is.na(matching_data$pair_id)))
+
+library(tidyverse)
+# pair_ps <- matching_data %>%
+#   mutate(pair_id = ms) %>%
+#   filter(!is.na(pair_id)) %>%
+#   group_by(pair_id) %>%
+#   summarise(
+#     treat_ps = pscore[treatment == 1],
+#     control_ps = pscore[treatment == 0],
+#     abs_diff = abs(treat_ps - control_ps)
+#   )
+# 
+# # Compute average and maximum absolute difference
+# avg_abs_diff_before <- mean(pair_ps$abs_diff, na.rm = TRUE)
+# max_abs_diff_before <- max(pair_ps$abs_diff, na.rm = TRUE)
+# 
+# cat("Average absolute PS difference =", round(avg_abs_diff_before, 4), "\n")
+# cat("Maximum absolute PS difference =", round(max_abs_diff_before, 4), "\n")
+# 
+# match_caliper <- addcaliper(match, z = matching_data$treatment, p = matching_data$pscore, 
+#                             caliper = 0.1 * sd(matching_data$pscore, na.rm = TRUE))
+# ms_cal <- pairmatch(match_caliper, data = matching_data)
+# 
+# # plot the covariate differences before and after matching
+# plot(xBalance(treatment ~ grade + female + age + language + region - 1, 
+#               strata = list(unstrat = NULL, ms.1 = ~ms_cal), data = matching_data), ggplot = TRUE)
+# 
+# # compute new pairwise PS differences after caliper matching
+# pair_ps_cal <- matching_data %>%
+#   mutate(pair_id = ms_cal) %>%
+#   filter(!is.na(pair_id)) %>%
+#   group_by(pair_id) %>%
+#   summarise(
+#     treat_ps = pscore[treatment == 1],
+#     control_ps = pscore[treatment == 0],
+#     abs_diff = abs(treat_ps - control_ps)
+#   )
+# 
+# # Average and maximum differences
+# avg_abs_diff_after <- mean(pair_ps_cal$abs_diff, na.rm = TRUE)
+# max_abs_diff_after <- max(pair_ps_cal$abs_diff, na.rm = TRUE)
+# 
+# cat("Average absolute PS difference after caliper =", round(avg_abs_diff_after, 4), "\n")
+# cat("Maximum absolute PS difference after caliper =", round(max_abs_diff_after, 4), "\n")
+
+matched_data <- matching_data %>% filter(!is.na(pair_id))
+
+# get the difference in y for each pairing
+diff_vec <- c()
+for (pair in unique(matched_data$pair_id)) {
+  treatment_y <- matched_data[(matched_data$pair_id == pair) & (matched_data$treatment == 1), 'read_comp_score']
+  control_y <- matched_data[(matched_data$pair_id == pair) & (matched_data$treatment == 0), 'read_comp_score']
+  diff_vec <- c(diff_vec, treatment_y - control_y)
+}
+tau_hat <- mean(diff_vec)
+
+# Fisher randomization test
+set.seed(42)
+B <- 1000
+sampled_tau_hats <- c()
+for (b in 1:B) {
+  # randomly change treatment/control for some matched pairs
+  random_signs <- sample(c(-1, +1), size = length(diff_vec), replace = TRUE)
+  diff_vec_resamp <- diff_vec * random_signs
+  sampled_tau_hats <- c(sampled_tau_hats, mean(diff_vec_resamp))
+}
+
+p_value <- mean(abs(sampled_tau_hats) >= abs(tau_hat))
+cat("p-value =", p_value)
+
+tau_hat
+```
+
+
+
+
