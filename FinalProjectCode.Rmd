@@ -16,6 +16,9 @@ data <- read.csv('endline.csv', header = TRUE)
 data <- data[, c("grade", "female", "age", "language", "region", "school_type", 
                  "encrypted_school_code", "treatment", "read_comp_score", "orf")]
 
+#school_type is collinear with treatment. Have to drop it. Grouping all controls regardless of type under "control" makes this variable useless.
+data <- data %>% select(-school_type)
+
 # change the treatment variable to a binary integer
 data$treatment <- ifelse(data$treatment == "Control", 0, 1)
 
@@ -29,8 +32,11 @@ data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.
 # remove rows with NAs
 data <- na.omit(data)
 
+# Age has a skewed distro with a massive outlier (someone aged 100). Will drop outlier as it seems like an error
+data <- data[data$age <= 60, ]
+
 # set up covariates (X), response (Y), and treatment (Z)
-X <- data[, c("grade", "female", "age", "language", "region", "school_type")]
+X <- data[, c("grade", "female", "age", "language", "region")]
 Z <- data$treatment
 Y <- data$read_comp_score # can also use orf (oral reading fluency)
 ```
