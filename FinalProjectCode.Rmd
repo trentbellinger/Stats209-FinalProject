@@ -37,7 +37,7 @@ data <- na.omit(data)
 data <- data[data$age <= 60, ]
 
 # set up covariates (X), response (Y), and treatment (Z)
-X <- data[, c("grade", "female", "age", "language", "region")]
+X <- data[, c("grade", "female", "age", "language", "region")] #language and region are colinear. Would remove one of them but kept it for now
 Z <- data$treatment
 Y <- data$read_comp_score # can also use orf (oral reading fluency)
 ```
@@ -129,7 +129,11 @@ school_covars <- dummy_cols(school_summary,
 
 #removing ids and common language
 school_covars <- school_covars %>% 
-  select(-common_language, -school_id) 
+  select(-common_language, -school_id)
+
+#commented code below removes covariates that I suspect are modeling noise
+#school_covars <- school_covars %>% 
+#  select(-common_language, -school_id,-num_male,-num_female,-num_2grade,-num_3grade) 
 
 # Center the covariates
 school_covars_centered <- scale(school_covars, center = TRUE, scale = FALSE)
@@ -207,7 +211,58 @@ summary(lin_model_orf)$coefficients["z", ]
 print("--- Lin's Estimator Results (Reading Score) student-level ---")
 summary(lin_model_read)$coefficients["z", ]
 ```
-*An analysis utilizing Lin's estimator at the school level showed that the intervention is statistically significant for both ORF and reading comprehension. The contrast with previous results is likely due to the fact that the aggregated covariates at the school level weren't very meaningful and allowed for noise in the model. Also in this set up with have a higher DF given lower amount of covariates. 
+*An analysis utilizing Lin's estimator at the student level showed that the intervention is statistically significant for both ORF and reading comprehension. The contrast with previous results is likely due to the fact that the aggregated covariates at the school level weren't very meaningful and allowed for noise in the model. Also in this set up with have a higher DF given lower amount of covariates. 
+
+#AIPW utilizing causal forrests
+*Causal forests handles cross fitting and hyper parameter tuning so me only need to train the model. It also builds the propensity score and outcome models simultaneously 
+```{r causal_forest_training}
+library(grf)
+Y1<- data$orf
+Y2<- data$read_comp_score
+school <- data$school_id
+cf1 <- causal_forest(
+  X = X_centered, 
+  Y = Y1, 
+  W = Z,
+  clusters = school, 
+  tune.parameters = "all"
+)
+cf2 <- causal_forest(
+  X = X_centered, 
+  Y = Y2, 
+  W = Z,
+  clusters = school, 
+  tune.parameters = "all"
+)
+```
+
+```{r causal_forest_analysis}
+print("----Results for ORF----")
+ate_result_orf <- average_treatment_effect(cf1, target.sample = "all")
+print(ate_result_orf)
+
+#getting variables that have the greatest interaction with treatment
+varimp <- variable_importance(cf1)
+ranked_vars <-order(varimp, decreasing = TRUE)
+colnames(X_centered)[ranked_vars]
+
+#checking predictors of treatment effect
+best_linear_projection(cf1, X_centered)
+
+print("----Results for Reading Comp----")
+ate_result_read_comp <- average_treatment_effect(cf2, target.sample = "all")
+print(ate_result_read_comp)
+
+#getting variables that have the greatest interaction with treatment
+varimp <- variable_importance(cf2)
+ranked_vars <-order(varimp, decreasing = TRUE)
+colnames(X_centered)[ranked_vars]
+
+#checking predictors of treatment effect
+best_linear_projection(cf2, X_centered)
+```
+*Results are similar to those found utilizing lin's estimator at the student level. 
+*HTE to note: Seems like the treatment is less effective across the board for the Sidamigna language. It also seems like the treatment has a greater effect on ORF for 3rd grade students. 
 
 # Clusters with Doubly-Robust Estimand
 
@@ -263,7 +318,12 @@ e_hat_school <- ps_model$fitted.values
 hist(e_hat_school)
 
 # expand to student level
-e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]# dont think we can do this. 
+#e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]# dont think we can do this. 
+
+ps_model_student <- glm(Z ~ . , data = X_enc, family = binomial)
+e_hat_student <- ps_model_student$fitted.values
+hist(e_hat_student)
+
 ```
 * As expected, propensity scores are centered around 0.5 given the randomized setup. 
 
@@ -299,9 +359,10 @@ paste0("tau_hat = ", tau_hat)
 U_s <- tapply(aipw, data$school_id, sum)   # length S
 S <- length(U_s)
 U_bar <- mean(U_s)
+N <-length(aipw)
 
-# variance estimator: Var(tau_hat) = 1/S^2 * Var_emp(U_s) where Var_emp uses (S-1) denom
-var_hat <- (1 / (S^2)) * (sum( (U_s - U_bar)^2) / (S - 1))
+# variance estimator: Var(tau_hat) = S/N^2 * Var_emp(U_s) where Var_emp uses (S-1) denom
+var_hat <- (S / (N^2)) * (sum( (U_s - U_bar)^2) / (S - 1))
 se_hat  <- sqrt(var_hat)
 paste0("SE_hat = ", se_hat)
 ```
