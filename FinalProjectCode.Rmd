@@ -10,7 +10,8 @@ https://www.datalumos.org/datalumos/project/237384/version/V1/view?path=/datalum
 ```{r}
 library(tidyverse)
 library(DescTools)
-
+library(estimatr)
+library(fastDummies)
 # read in the csv and choose the columns we will use
 data <- read.csv('endline.csv', header = TRUE)
 data <- data[, c("grade", "female", "age", "language", "region", "school_type", 
@@ -54,23 +55,85 @@ school_level_data <- data %>%
 y1 <- school_level_data$orf
 y2 <- school_level_data$r_comp_scr
 z <- school_level_data$z
+
 model <- lm(y1 ~ z, data = school_level_data)
-model_summary <- summary(model)
-ate_orf <- model_summary$coefficients["z", "Estimate"]
-p_val_orf <- model_summary$coefficients["z", "Pr(>|t|)"]
+model_summary_orf <- summary(model)
 
 model <- lm(y2 ~ z, data = school_level_data)
-model_summary <- summary(model)
-ate_r_comp <- model_summary$coefficients["z", "Estimate"]
-p_val_r_comp <- model_summary$coefficients["z", "Pr(>|t|)"]
+model_summary_r_comp <- summary(model)
 
-print(paste("ATE on Oral Fluency:", round(ate_orf,digits=4)))
-print(paste("P-value (orf):", round(p_val_orf,digits=4)))
+print("--- ORF Results ---")
+model_summary_orf$coefficients["z", ]
 
-print(paste("ATE on Reading Comprehension:", round(ate_r_comp,digits=4)))
-print(paste("P-value (r_comp):", round(p_val_r_comp,digits=4)))
+print("--- Reading Comp Results ---")
+model_summary_r_comp$coefficients["z", ]
 ```
-*Doing a simple analysis at the school level shows that there is only a statistically significant treatment effect on oral fluency, not reading comprehension. However, this didn't deploy any variance reduction techniques, which could render statistically significant results for both. 
+* Doing a simple analysis at the school level shows that there is only a statistically significant treatment effect on oral reading fluency, not reading comprehension. However, this didn't deploy any variance reduction techniques, which could render statistically significant results for both. 
+
+* Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level.
+* We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, and region of each school.
+
+```{r aggregate covariates by school}
+# collapse student covariates to school level for the propensity model
+school_summary <- X %>%
+  mutate(school_id = data$school_id) %>%
+  group_by(school_id) %>%
+  mutate(num_2grade = sum(grade == 2)) %>%
+  mutate(num_3grade = sum(grade == 3)) %>%
+  mutate(num_female = sum(female == "Female")) %>%
+  mutate(num_male = sum(female == "Male")) %>%
+  mutate(avg_age = mean(age)) %>%
+  mutate(sd_age = sd(age)) %>%
+  mutate(region = Mode(region)) %>%
+  mutate(common_language = Mode(language)) %>%
+  select(-grade, -female, -age, -language, -region) %>%
+  distinct()
+head(school_summary)
+```
+
+# school-level analysis with lin's estimator (variance reduction)
+```{r lin estimator analysis}
+##OHE common language
+school_covars <- dummy_cols(school_summary, 
+                   select_columns = "common_language", 
+                   remove_first_dummy = TRUE)
+
+#removing ids and common language
+school_covars <- school_covars %>% 
+  select(-common_language, -school_id) 
+
+# Center the covariates
+school_covars_centered <- scale(school_covars, center = TRUE, scale = FALSE)
+
+X_centered <- as.data.frame(school_covars_centered)
+
+analysis_df <- data.frame(
+  orf = school_level_data$orf,           # Y1
+  read_score = school_level_data$r_comp_scr, # Y2
+  z = school_level_data$z,               # Treatment
+  X_centered                             # All centered covariates
+)
+
+#Create regression formula dynamically
+covariate_names <- colnames(X_centered)
+rhs_formula <- paste("z * (", paste(covariate_names, collapse = " + "), ")")
+
+#Model for ORF (Y1)
+formula_orf <- as.formula(paste("orf ~", rhs_formula))
+lin_model_orf <- lm_robust(formula_orf, data = analysis_df)
+
+#Model for Reading Score (Y2)
+formula_read <- as.formula(paste("read_score ~", rhs_formula))
+lin_model_read <- lm_robust(formula_read, data = analysis_df)
+
+# results
+print("--- Lin's Estimator Results (ORF) ---")
+summary(lin_model_orf)$coefficients["z", ]
+
+print("--- Lin's Estimator Results (Reading Score) ---")
+summary(lin_model_read)$coefficients["z", ]
+```
+*The standard errors decreased utilizing Lin's estimator, showing it effectively reduced variance. However, the treatment effects and their corresponding p-values decreased. Now, the treatment effect on ORF isn't statistically significant. This is likely a result of randomly having better students in treatment vs control. 
 
 # Clusters with Doubly-Robust Estimand
 
@@ -117,28 +180,7 @@ k_vec <- schools_treatment$school_id
 T_vec <- schools_treatment$treatment
 ```
 
-* Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level to estimate propensity score.
-* We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, region, and school type of each school.
-
-```{r aggregate covariates by school}
-# collapse student covariates to school level for the propensity model
-school_summary <- X %>%
-  mutate(school_id = data$school_id) %>%
-  group_by(school_id) %>%
-  mutate(num_2grade = sum(grade == 2)) %>%
-  mutate(num_3grade = sum(grade == 3)) %>%
-  mutate(num_female = sum(female == "Female")) %>%
-  mutate(num_male = sum(female == "Male")) %>%
-  mutate(avg_age = mean(age)) %>%
-  mutate(sd_age = sd(age)) %>%
-  mutate(region = Mode(region)) %>%
-  mutate(common_language = Mode(language)) %>%
-  select(-grade, -female, -age, -language, -region) %>%
-  distinct()
-head(school_summary)
-```
-
-* Now that we have aggregated covariates, we can calculate the propensity score for each school using logistic regression.
+*We can calculate the propensity score for each school using logistic regression.
 
 ```{r school-level ps}
 # estimate school-level propensity score using logistic regression
@@ -147,8 +189,7 @@ e_hat_school <- ps_model$fitted.values
 hist(e_hat_school)
 
 # expand to student level
-e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]
-hist(e_hat_student)
+e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]# dont think we can do this. 
 ```
 * As expected, propensity scores are centered around 0.5 given the randomized setup. 
 
