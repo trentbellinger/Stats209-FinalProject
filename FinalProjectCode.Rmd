@@ -2,7 +2,9 @@
 title: "Stats 209 Final Project Code"
 author: "Trent Bellinger"
 date: "`r Sys.Date()`"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 https://www.datalumos.org/datalumos/project/237384/version/V1/view?path=/datalumos/237384/fcr:versions/V1/Ethiopia/Improving-Quality-of-Primary-Education-Program--IQPEP-
@@ -10,11 +12,15 @@ https://www.datalumos.org/datalumos/project/237384/version/V1/view?path=/datalum
 ```{r}
 library(tidyverse)
 library(DescTools)
-
+library(estimatr)
+library(fastDummies)
 # read in the csv and choose the columns we will use
 data <- read.csv('endline.csv', header = TRUE)
 data <- data[, c("grade", "female", "age", "language", "region", "school_type", 
                  "encrypted_school_code", "treatment", "read_comp_score", "orf")]
+
+#school_type is collinear with treatment. Have to drop it. Grouping all controls regardless of type under "control" makes this variable useless.
+data <- data %>% select(-school_type)
 
 # change the treatment variable to a binary integer
 data$treatment <- ifelse(data$treatment == "Control", 0, 1)
@@ -29,11 +35,236 @@ data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.
 # remove rows with NAs
 data <- na.omit(data)
 
+# Age has a skewed distro with a massive outlier (someone aged 100). Will drop outlier as it seems like an error
+data <- data[data$age <= 60, ]
+
 # set up covariates (X), response (Y), and treatment (Z)
-X <- data[, c("grade", "female", "age", "language", "region", "school_type")]
+X <- data[, c("grade", "female", "age", "language", "region")] #language and region are colinear. Would remove one of them but kept it for now
 Z <- data$treatment
 Y <- data$read_comp_score # can also use orf (oral reading fluency)
 ```
+
+# Baseline school-level analysis
+```{r baseline}
+school_level_data <- data %>% 
+  group_by(school_id) %>% 
+  summarise(
+    orf = mean(orf, na.rm = TRUE), 
+    r_comp_scr = mean(read_comp_score, na.rm = TRUE),
+    z = mean(treatment, na.rm = TRUE)        
+  )
+
+y1 <- school_level_data$orf
+y2 <- school_level_data$r_comp_scr
+z <- school_level_data$z
+
+model <- lm(y1 ~ z, data = school_level_data)
+model_summary_orf <- summary(model)
+
+model <- lm(y2 ~ z, data = school_level_data)
+model_summary_r_comp <- summary(model)
+
+print("--- ORF Results ---")
+model_summary_orf$coefficients["z", ]
+
+print("--- Reading Comp Results ---")
+model_summary_r_comp$coefficients["z", ]
+```
+* Doing a simple analysis at the school level shows that there is only a statistically significant treatment effect on oral reading fluency, not reading comprehension. However, this didn't deploy any variance reduction techniques, which could render statistically significant results for both. 
+
+# Grade-level simple analysis
+```{r grade-level analysis}
+grade_level_data <- data %>% 
+  group_by(school_id,grade) %>% 
+  summarise(
+    orf = mean(orf, na.rm = TRUE), 
+    r_comp_scr = mean(read_comp_score, na.rm = TRUE),
+    z = mean(treatment, na.rm = TRUE),
+    grade_3 = ifelse(first(grade)==3,1,0),
+    .groups = "drop"
+  )
+
+y1 <- grade_level_data$orf
+y2 <- grade_level_data$r_comp_scr
+z <- grade_level_data$z
+
+model <- lm_robust(y1 ~ z*grade_3, data = grade_level_data, clusters=school_id) ##clusters accounts for randomization at school level
+model_summary_orf <- summary(model)
+
+model <- lm_robust(y2 ~ z*grade_3, data = grade_level_data, clusters=school_id)
+model_summary_r_comp <- summary(model)
+
+print("--- ORF Results ---")
+model_summary_orf$coefficients[c("z","z:grade_3"),1:4 ]
+
+print("--- Reading Comp Results ---")
+model_summary_r_comp$coefficients[c("z","z:grade_3"),1:4 ]
+```
+# school-level covariates
+* Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level.
+* We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, and region of each school.
+
+```{r aggregate_covariates_by_school}
+# collapse student covariates to school level for the propensity model
+school_summary <- X %>%
+  mutate(school_id = data$school_id) %>%
+  group_by(school_id) %>%
+  mutate(num_2grade = sum(grade == 2)) %>%
+  mutate(num_3grade = sum(grade == 3)) %>%
+  mutate(num_female = sum(female == "Female")) %>%
+  mutate(num_male = sum(female == "Male")) %>%
+  mutate(avg_age = mean(age)) %>%
+  mutate(sd_age = sd(age)) %>%
+  mutate(region = Mode(region)) %>%
+  mutate(common_language = Mode(language)) %>%
+  select(-grade, -female, -age, -language, -region) %>%
+  distinct()
+head(school_summary)
+```
+
+# school-level analysis with lin's estimator (variance reduction)
+```{r lin estimator analysis}
+##OHE common language
+school_covars <- dummy_cols(school_summary, 
+                   select_columns = "common_language", 
+                   remove_first_dummy = TRUE)
+
+#removing ids and common language
+school_covars <- school_covars %>% 
+  select(-common_language, -school_id)
+
+#commented code below removes covariates that I suspect are modeling noise
+#school_covars <- school_covars %>% 
+#  select(-common_language, -school_id,-num_male,-num_female,-num_2grade,-num_3grade) 
+
+# Center the covariates
+school_covars_centered <- scale(school_covars, center = TRUE, scale = FALSE)
+
+X_centered <- as.data.frame(school_covars_centered)
+
+analysis_df <- data.frame(
+  orf = school_level_data$orf,           # Y1
+  read_score = school_level_data$r_comp_scr, # Y2
+  z = school_level_data$z,               # Treatment
+  X_centered                             # All centered covariates
+)
+
+#Create regression formula dynamically
+covariate_names <- colnames(X_centered)
+rhs_formula <- paste("z * (", paste(covariate_names, collapse = " + "), ")")
+
+#Model for ORF (Y1)
+formula_orf <- as.formula(paste("orf ~", rhs_formula))
+lin_model_orf <- lm_robust(formula_orf, data = analysis_df)
+
+#Model for Reading Score (Y2)
+formula_read <- as.formula(paste("read_score ~", rhs_formula))
+lin_model_read <- lm_robust(formula_read, data = analysis_df)
+
+# results
+print("--- Lin's Estimator Results (ORF) ---")
+summary(lin_model_orf)$coefficients["z", ]
+
+print("--- Lin's Estimator Results (Reading Score) ---")
+summary(lin_model_read)$coefficients["z", ]
+```
+*The standard errors decreased utilizing Lin's estimator, showing it effectively reduced variance. However, the treatment effects and their corresponding p-values decreased. Now, the treatment effect on ORF isn't statistically significant. This is likely a result of randomly having better students in treatment vs control. 
+
+# Student-level analysis with Lin's estimator
+```{r lin estimator analysis}
+##OHE language
+X_enc <- dummy_cols(X, 
+                   select_columns = "language", 
+                   remove_first_dummy = TRUE)
+X_enc$female <- ifelse(X_enc$female =="Female",1,0)
+#keeping only covars
+X_enc <- X_enc %>% 
+  select(-language, -region) 
+
+# Center the covariates
+X_enc_cen <- scale(X_enc, center = TRUE, scale = FALSE)
+
+X_centered <- as.data.frame(X_enc_cen)
+
+analysis_df <- data.frame(
+  orf = data$orf,                    # Y1
+  read_score = data$read_comp_score, # Y2
+  z = Z,                             # Treatment
+  school_id = data$school_id,        # school id
+  X_centered                         # All centered covariates
+)
+
+#Create regression formula dynamically
+covariate_names <- colnames(X_centered)
+rhs_formula <- paste("z * (", paste(covariate_names, collapse = " + "), ")")
+
+#Model for ORF (Y1)
+formula_orf <- as.formula(paste("orf ~", rhs_formula))
+lin_model_orf <- lm_robust(formula_orf, data = analysis_df,clusters =school_id )
+
+#Model for Reading Score (Y2)
+formula_read <- as.formula(paste("read_score ~", rhs_formula))
+lin_model_read <- lm_robust(formula_read, data = analysis_df,clusters =school_id)
+
+# results
+print("--- Lin's Estimator Results (ORF) student-level ---")
+summary(lin_model_orf)$coefficients["z", ]
+
+print("--- Lin's Estimator Results (Reading Score) student-level ---")
+summary(lin_model_read)$coefficients["z", ]
+```
+*An analysis utilizing Lin's estimator at the student level showed that the intervention is statistically significant for both ORF and reading comprehension. The contrast with previous results is likely due to the fact that the aggregated covariates at the school level weren't very meaningful and allowed for noise in the model. Also in this set up with have a higher DF given lower amount of covariates. 
+
+#AIPW utilizing causal forrests
+*Causal forests handles cross fitting and hyper parameter tuning so me only need to train the model. It also builds the propensity score and outcome models simultaneously 
+```{r causal_forest_training}
+library(grf)
+Y1<- data$orf
+Y2<- data$read_comp_score
+school <- data$school_id
+cf1 <- causal_forest(
+  X = X_centered, 
+  Y = Y1, 
+  W = Z,
+  clusters = school, 
+  tune.parameters = "all"
+)
+cf2 <- causal_forest(
+  X = X_centered, 
+  Y = Y2, 
+  W = Z,
+  clusters = school, 
+  tune.parameters = "all"
+)
+```
+
+```{r causal_forest_analysis}
+print("----Results for ORF----")
+ate_result_orf <- average_treatment_effect(cf1, target.sample = "all")
+print(ate_result_orf)
+
+#getting variables that have the greatest interaction with treatment
+varimp <- variable_importance(cf1)
+ranked_vars <-order(varimp, decreasing = TRUE)
+colnames(X_centered)[ranked_vars]
+
+#checking predictors of treatment effect
+best_linear_projection(cf1, X_centered)
+
+print("----Results for Reading Comp----")
+ate_result_read_comp <- average_treatment_effect(cf2, target.sample = "all")
+print(ate_result_read_comp)
+
+#getting variables that have the greatest interaction with treatment
+varimp <- variable_importance(cf2)
+ranked_vars <-order(varimp, decreasing = TRUE)
+colnames(X_centered)[ranked_vars]
+
+#checking predictors of treatment effect
+best_linear_projection(cf2, X_centered)
+```
+*Results are similar to those found utilizing lin's estimator at the student level. 
+*HTE to note: Seems like the treatment is less effective across the board for the Sidamigna language. It also seems like the treatment has a greater effect on ORF for 3rd grade students. 
 
 # Clusters with Doubly-Robust Estimand
 
@@ -80,38 +311,23 @@ k_vec <- schools_treatment$school_id
 T_vec <- schools_treatment$treatment
 ```
 
-* Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level to estimate propensity score.
-* We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, region, and school type of each school.
-
-```{r aggregate covariates by school}
-# collapse student covariates to school level for the propensity model
-school_summary <- X %>%
-  mutate(school_id = data$school_id) %>%
-  group_by(school_id) %>%
-  mutate(num_2grade = sum(grade == 2)) %>%
-  mutate(num_3grade = sum(grade == 3)) %>%
-  mutate(num_female = sum(female == "Female")) %>%
-  mutate(num_male = sum(female == "Male")) %>%
-  mutate(avg_age = mean(age)) %>%
-  mutate(sd_age = sd(age)) %>%
-  mutate(region = Mode(region)) %>%
-  mutate(common_language = Mode(language)) %>%
-  mutate(school_type = Mode(school_type)) %>%
-  select(-grade, -female, -age, -language, -region) %>%
-  distinct()
-head(school_summary)
-```
-
-* Now that we have aggregated covariates, we can calculate the propensity score for each school using logistic regression.
+*We can calculate the propensity score for each school using logistic regression.
 
 ```{r school-level ps}
 # estimate school-level propensity score using logistic regression
 ps_model <- glm(T_vec ~ . - school_id, data = school_summary, family = binomial)
 e_hat_school <- ps_model$fitted.values
+hist(e_hat_school)
 
 # expand to student level
-e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]
+#e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]# dont think we can do this. 
+
+ps_model_student <- glm(Z ~ . , data = X_enc, family = binomial)
+e_hat_student <- ps_model_student$fitted.values
+hist(e_hat_student)
+
 ```
+* As expected, propensity scores are centered around 0.5 given the randomized setup. 
 
 * Now that we have propensity scores for each school, we will create an outcome model on the student level using linear regression. We will evaluate that model on each student with $Z=1$ and $Z=0$ to get $\mu_{1}$ and $\mu_{0}$.
 
@@ -128,7 +344,7 @@ mu1_hat <- predict(out_mod, newdata = data_Z1)
 mu0_hat <- predict(out_mod, newdata = data_Z0)
 ```
 
-* Now that we have propensity score and outcome model prediction fro each student/school, we can compute a doubly-robust AIPW estimand for each student. Our final estimand will be thge mean of these values.
+* Now that we have propensity score and outcome model prediction fro each student/school, we can compute a doubly-robust AIPW estimand for each student. Our final estimand will be the mean of these values.
 
 ```{r AIPW tau_hat}
 # AIPW score per student
@@ -145,9 +361,10 @@ paste0("tau_hat = ", tau_hat)
 U_s <- tapply(aipw, data$school_id, sum)   # length S
 S <- length(U_s)
 U_bar <- mean(U_s)
+N <-length(aipw)
 
-# variance estimator: Var(tau_hat) = 1/S^2 * Var_emp(U_s) where Var_emp uses (S-1) denom
-var_hat <- (1 / (S^2)) * (sum( (U_s - U_bar)^2) / (S - 1))
+# variance estimator: Var(tau_hat) = S/N^2 * Var_emp(U_s) where Var_emp uses (S-1) denom
+var_hat <- (S / (N^2)) * (sum( (U_s - U_bar)^2) / (S - 1))
 se_hat  <- sqrt(var_hat)
 paste0("SE_hat = ", se_hat)
 ```
