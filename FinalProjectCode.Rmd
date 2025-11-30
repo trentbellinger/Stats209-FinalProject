@@ -70,6 +70,35 @@ model_summary_r_comp$coefficients["z", ]
 ```
 * Doing a simple analysis at the school level shows that there is only a statistically significant treatment effect on oral reading fluency, not reading comprehension. However, this didn't deploy any variance reduction techniques, which could render statistically significant results for both. 
 
+# Grade-level simple analysis
+```{r grade-level analysis}
+grade_level_data <- data %>% 
+  group_by(school_id,grade) %>% 
+  summarise(
+    orf = mean(orf, na.rm = TRUE), 
+    r_comp_scr = mean(read_comp_score, na.rm = TRUE),
+    z = mean(treatment, na.rm = TRUE),
+    grade_3 = ifelse(first(grade)==3,1,0),
+    .groups = "drop"
+  )
+
+y1 <- grade_level_data$orf
+y2 <- grade_level_data$r_comp_scr
+z <- grade_level_data$z
+
+model <- lm_robust(y1 ~ z*grade_3, data = grade_level_data, clusters=school_id) ##clusters accounts for randomization at school level
+model_summary_orf <- summary(model)
+
+model <- lm_robust(y2 ~ z*grade_3, data = grade_level_data, clusters=school_id)
+model_summary_r_comp <- summary(model)
+
+print("--- ORF Results ---")
+model_summary_orf$coefficients[c("z","z:grade_3"),1:4 ]
+
+print("--- Reading Comp Results ---")
+model_summary_r_comp$coefficients[c("z","z:grade_3"),1:4 ]
+```
+# school-level covariates
 * Because our cluster experiment is at the school level, we need to aggregate the covariates at the school level.
 * We will get the number of second graders, number of third graders, number of females, number of males, average age, standard deviation of age, and region of each school.
 
@@ -134,6 +163,51 @@ print("--- Lin's Estimator Results (Reading Score) ---")
 summary(lin_model_read)$coefficients["z", ]
 ```
 *The standard errors decreased utilizing Lin's estimator, showing it effectively reduced variance. However, the treatment effects and their corresponding p-values decreased. Now, the treatment effect on ORF isn't statistically significant. This is likely a result of randomly having better students in treatment vs control. 
+
+# Student-level analysis with Lin's estimator
+```{r lin estimator analysis}
+##OHE language
+X_enc <- dummy_cols(X, 
+                   select_columns = "language", 
+                   remove_first_dummy = TRUE)
+X_enc$female <- ifelse(X_enc$female =="Female",1,0)
+#keeping only covars
+X_enc <- X_enc %>% 
+  select(-language, -region) 
+
+# Center the covariates
+X_enc_cen <- scale(X_enc, center = TRUE, scale = FALSE)
+
+X_centered <- as.data.frame(X_enc_cen)
+
+analysis_df <- data.frame(
+  orf = data$orf,                    # Y1
+  read_score = data$read_comp_score, # Y2
+  z = Z,                             # Treatment
+  school_id = data$school_id,        # school id
+  X_centered                         # All centered covariates
+)
+
+#Create regression formula dynamically
+covariate_names <- colnames(X_centered)
+rhs_formula <- paste("z * (", paste(covariate_names, collapse = " + "), ")")
+
+#Model for ORF (Y1)
+formula_orf <- as.formula(paste("orf ~", rhs_formula))
+lin_model_orf <- lm_robust(formula_orf, data = analysis_df,clusters =school_id )
+
+#Model for Reading Score (Y2)
+formula_read <- as.formula(paste("read_score ~", rhs_formula))
+lin_model_read <- lm_robust(formula_read, data = analysis_df,clusters =school_id)
+
+# results
+print("--- Lin's Estimator Results (ORF) student-level ---")
+summary(lin_model_orf)$coefficients["z", ]
+
+print("--- Lin's Estimator Results (Reading Score) student-level ---")
+summary(lin_model_read)$coefficients["z", ]
+```
+*An analysis utilizing Lin's estimator at the school level showed that the intervention is statistically significant for both ORF and reading comprehension. The contrast with previous results is likely due to the fact that the aggregated covariates at the school level weren't very meaningful and allowed for noise in the model. Also in this set up with have a higher DF given lower amount of covariates. 
 
 # Clusters with Doubly-Robust Estimand
 
