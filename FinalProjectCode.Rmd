@@ -41,6 +41,37 @@ Z <- data$treatment
 Y <- data$read_comp_score # can also use orf (oral reading fluency)
 ```
 
+# Baseline school-level analysis
+```{r baseline}
+school_level_data <- data %>% 
+  group_by(school_id) %>% 
+  summarise(
+    orf = mean(orf, na.rm = TRUE), 
+    r_comp_scr = mean(read_comp_score, na.rm = TRUE),
+    z = mean(treatment, na.rm = TRUE)        
+  )
+
+y1 <- school_level_data$orf
+y2 <- school_level_data$r_comp_scr
+z <- school_level_data$z
+model <- lm(y1 ~ z, data = school_level_data)
+model_summary <- summary(model)
+ate_orf <- model_summary$coefficients["z", "Estimate"]
+p_val_orf <- model_summary$coefficients["z", "Pr(>|t|)"]
+
+model <- lm(y2 ~ z, data = school_level_data)
+model_summary <- summary(model)
+ate_r_comp <- model_summary$coefficients["z", "Estimate"]
+p_val_r_comp <- model_summary$coefficients["z", "Pr(>|t|)"]
+
+print(paste("ATE on Oral Fluency:", round(ate_orf,digits=4)))
+print(paste("P-value (orf):", round(p_val_orf,digits=4)))
+
+print(paste("ATE on Reading Comprehension:", round(ate_r_comp,digits=4)))
+print(paste("P-value (r_comp):", round(p_val_r_comp,digits=4)))
+```
+*Doing a simple analysis at the school level shows that there is only a statistically significant treatment effect on oral fluency, not reading comprehension. However, this didn't deploy any variance reduction techniques, which could render statistically significant results for both. 
+
 # Clusters with Doubly-Robust Estimand
 
 * We conduct a cluster random experiment with school as the cluster.
@@ -102,7 +133,6 @@ school_summary <- X %>%
   mutate(sd_age = sd(age)) %>%
   mutate(region = Mode(region)) %>%
   mutate(common_language = Mode(language)) %>%
-  mutate(school_type = Mode(school_type)) %>%
   select(-grade, -female, -age, -language, -region) %>%
   distinct()
 head(school_summary)
@@ -114,10 +144,13 @@ head(school_summary)
 # estimate school-level propensity score using logistic regression
 ps_model <- glm(T_vec ~ . - school_id, data = school_summary, family = binomial)
 e_hat_school <- ps_model$fitted.values
+hist(e_hat_school)
 
 # expand to student level
 e_hat_student <- e_hat_school[match(data$school_id, school_summary$school_id)]
+hist(e_hat_student)
 ```
+* As expected, propensity scores are centered around 0.5 given the randomized setup. 
 
 * Now that we have propensity scores for each school, we will create an outcome model on the student level using linear regression. We will evaluate that model on each student with $Z=1$ and $Z=0$ to get $\mu_{1}$ and $\mu_{0}$.
 
@@ -134,7 +167,7 @@ mu1_hat <- predict(out_mod, newdata = data_Z1)
 mu0_hat <- predict(out_mod, newdata = data_Z0)
 ```
 
-* Now that we have propensity score and outcome model prediction fro each student/school, we can compute a doubly-robust AIPW estimand for each student. Our final estimand will be thge mean of these values.
+* Now that we have propensity score and outcome model prediction fro each student/school, we can compute a doubly-robust AIPW estimand for each student. Our final estimand will be the mean of these values.
 
 ```{r AIPW tau_hat}
 # AIPW score per student
